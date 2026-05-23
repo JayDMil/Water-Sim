@@ -1,0 +1,663 @@
+﻿#include <windows.h>
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <string>
+#include <cstdlib>
+#include <ctime>
+#include <algorithm>
+#include <gl/GL.h>
+#include <gl/GLU.h>
+
+#pragma comment(lib, "opengl32.lib")
+#pragma comment(lib, "glu32.lib")
+
+// Forward declarations
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+
+// --- Simulation Constants ---
+const int WINDOW_WIDTH = 1024;
+const int WINDOW_HEIGHT = 768;
+const float GRAVITY = 1500.0f;      // Strength of gravity
+const float PARTICLE_RADIUS = 12.0f; // Visual radius of particles
+const float DAMPING = 0.5f;         // Energy loss on collision 
+const int MAX_PARTICLES = 3000;     // Max limit for performance
+
+// --- Particle Structure ---
+struct Particle {
+    float x, y, z;     // Position
+    float vx, vy, vz;  // Velocity
+};
+
+// --- 3D Box for container ---
+struct Bounds {
+    float minX, maxX;
+    float minY, maxY;
+    float minZ, maxZ;
+};
+
+// --- Simulation State ---
+std::vector<Particle> particles;
+Bounds container = {-300.0f, 300.0f, -100.0f, 100.0f, -150.0f, 150.0f};
+
+bool isDragging = false;
+bool isPouring = false;
+POINT lastMousePos;
+
+float cameraPosX = 0.0f;
+float cameraPosY = 200.0f;
+float cameraPosZ = 800.0f;
+float cameraAngleX = 20.0f;
+float cameraAngleY = 0.0f;
+float cameraDistance = 0.0f; // No longer orbiting center
+
+float tubPosX = 0.0f;
+float tubPosY = 0.0f;
+float tubPosZ = 0.0f;
+float tubAngleX = 0.0f;
+float tubAngleY = 0.0f;
+float tubAngleZ = 0.0f;
+
+int gizmoMode = 0; // 0=Translate, 1=Rotate
+int activeGizmoAxis = 0; // 0=None, 1=X, 2=Y, 3=Z
+bool isDraggingGizmo = false;
+bool isLooking = false;
+
+float spawnX = 0.0f;
+float spawnY = 200.0f;
+float spawnZ = 0.0f;
+
+HDC hDC_global = NULL;
+HGLRC hRC_global = NULL;
+
+// --- Function Prototypes ---
+void InitSimulation();
+void UpdateSimulation(float deltaTime);
+void RenderSimulation();
+void SetupPixelFormat(HDC hDC);
+
+// --- WinMain: Application Entry Point ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    const wchar_t CLASS_NAME[] = L"WaterSimWindowClass";
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    RegisterClassW(&wc);
+
+    HWND hWnd = CreateWindowExW(
+        0,
+        CLASS_NAME,
+        L"Water Simulation",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_WIDTH, WINDOW_HEIGHT,
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (hWnd == NULL) {
+        return 0;
+    }
+
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+
+    // Main message loop for real-time updates
+    MSG msg = {};
+    auto lastTime = std::chrono::high_resolution_clock::now();
+
+    while (true) {
+        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        else {
+            // Game loop logic
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<float> deltaTime = currentTime - lastTime;
+            lastTime = currentTime;
+
+            UpdateSimulation(deltaTime.count());
+            RenderSimulation();
+        }
+    }
+
+    return (int)msg.wParam;
+}
+
+// Wrapper for Console Subsystem builds
+int main() {
+    return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOWDEFAULT);
+}
+
+// Helper to compute distance from ray to line segment
+float DistanceRaySegment(float rx, float ry, float rz, float rdx, float rdy, float rdz, 
+                         float px, float py, float pz, float dx, float dy, float dz, float length) {
+    float cx = rdy * dz - rdz * dy;
+    float cy = rdz * dx - rdx * dz;
+    float cz = rdx * dy - rdy * dx;
+    float denom = sqrt(cx*cx + cy*cy + cz*cz);
+    if (denom < 0.0001f) return 9999.0f;
+    float dist = abs((px - rx)*cx + (py - ry)*cy + (pz - rz)*cz) / denom;
+    return dist;
+}
+
+// Helper to compute distance from ray to rotation ring
+float IntersectRing(float rx, float ry, float rz, float rdx, float rdy, float rdz,
+                    float cx, float cy, float cz, int axis, float radius) {
+    float t = -1.0f;
+    if (axis == 1 && abs(rdx) > 0.0001f) t = (cx - rx) / rdx;
+    if (axis == 2 && abs(rdy) > 0.0001f) t = (cy - ry) / rdy;
+    if (axis == 3 && abs(rdz) > 0.0001f) t = (cz - rz) / rdz;
+
+    if (t > 0.0f) {
+        float px = rx + t * rdx;
+        float py = ry + t * rdy;
+        float pz = rz + t * rdz;
+        float dist = sqrt((px-cx)*(px-cx) + (py-cy)*(py-cy) + (pz-cz)*(pz-cz));
+        return abs(dist - radius);
+    }
+    return 9999.0f;
+}
+
+// --- WndProc: Window Message Handler ---
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        hDC_global = GetDC(hWnd);
+        SetupPixelFormat(hDC_global);
+        hRC_global = wglCreateContext(hDC_global);
+        wglMakeCurrent(hDC_global, hRC_global);
+
+        glEnable(GL_DEPTH_TEST);
+        glEnable(GL_LIGHTING);
+        glEnable(GL_LIGHT0);
+        glEnable(GL_COLOR_MATERIAL);
+
+        InitSimulation();
+        break;
+
+    case WM_DESTROY:
+        wglMakeCurrent(NULL, NULL);
+        if (hRC_global) wglDeleteContext(hRC_global);
+        if (hDC_global) ReleaseDC(hWnd, hDC_global);
+        PostQuitMessage(0);
+        break;
+
+    case WM_SIZE:
+        {
+            int width = LOWORD(lParam);
+            int height = HIWORD(lParam);
+            if (height == 0) height = 1;
+            glViewport(0, 0, width, height);
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            gluPerspective(45.0, (double)width / height, 1.0, 2000.0);
+            glMatrixMode(GL_MODELVIEW);
+        }
+        break;
+
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            BeginPaint(hWnd, &ps);
+            RenderSimulation();
+            EndPaint(hWnd, &ps);
+        }
+        break;
+
+    case WM_ERASEBKGND:
+        return 1; // Prevents flickering
+
+    case WM_LBUTTONDOWN:
+        {
+            lastMousePos.x = LOWORD(lParam);
+            lastMousePos.y = HIWORD(lParam);
+
+            // Unproject ray
+            GLdouble model[16], proj[16];
+            GLint view[4];
+            glGetDoublev(GL_MODELVIEW_MATRIX, model);
+            glGetDoublev(GL_PROJECTION_MATRIX, proj);
+            glGetIntegerv(GL_VIEWPORT, view);
+            GLdouble x1, y1, z1, x2, y2, z2;
+            gluUnProject(lastMousePos.x, view[3] - lastMousePos.y, 0.0, model, proj, view, &x1, &y1, &z1);
+            gluUnProject(lastMousePos.x, view[3] - lastMousePos.y, 1.0, model, proj, view, &x2, &y2, &z2);
+            float rdx = (float)(x2-x1), rdy = (float)(y2-y1), rdz = (float)(z2-z1);
+            float rlen = sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+            rdx/=rlen; rdy/=rlen; rdz/=rlen;
+
+            activeGizmoAxis = 0;
+            float threshold = 20.0f; // click tolerance
+
+            if (gizmoMode == 0) {
+                float distX = DistanceRaySegment((float)x1, (float)y1, (float)z1, rdx, rdy, rdz, tubPosX, tubPosY, tubPosZ, 1, 0, 0, 150.0f);
+                float distY = DistanceRaySegment((float)x1, (float)y1, (float)z1, rdx, rdy, rdz, tubPosX, tubPosY, tubPosZ, 0, 1, 0, 150.0f);
+                float distZ = DistanceRaySegment((float)x1, (float)y1, (float)z1, rdx, rdy, rdz, tubPosX, tubPosY, tubPosZ, 0, 0, 1, 150.0f);
+
+                if (distX < threshold && distX < distY && distX < distZ) activeGizmoAxis = 1;
+                else if (distY < threshold && distY < distZ) activeGizmoAxis = 2;
+                else if (distZ < threshold) activeGizmoAxis = 3;
+            } else {
+                float radius = 150.0f;
+                float distX = IntersectRing((float)x1, (float)y1, (float)z1, rdx, rdy, rdz, tubPosX, tubPosY, tubPosZ, 1, radius);
+                float distY = IntersectRing((float)x1, (float)y1, (float)z1, rdx, rdy, rdz, tubPosX, tubPosY, tubPosZ, 2, radius);
+                float distZ = IntersectRing((float)x1, (float)y1, (float)z1, rdx, rdy, rdz, tubPosX, tubPosY, tubPosZ, 3, radius);
+
+                if (distX < threshold && distX < distY && distX < distZ) activeGizmoAxis = 1;
+                else if (distY < threshold && distY < distZ) activeGizmoAxis = 2;
+                else if (distZ < threshold) activeGizmoAxis = 3;
+            }
+
+            if (activeGizmoAxis != 0) {
+                isDraggingGizmo = true;
+                SetCapture(hWnd);
+            }
+        }
+        break;
+
+    case WM_LBUTTONUP:
+        isDraggingGizmo = false;
+        activeGizmoAxis = 0;
+        ReleaseCapture();
+        break;
+
+    case WM_RBUTTONDOWN:
+        isLooking = true;
+        SetCapture(hWnd);
+        lastMousePos.x = LOWORD(lParam);
+        lastMousePos.y = HIWORD(lParam);
+        break;
+
+    case WM_RBUTTONUP:
+        isLooking = false;
+        ReleaseCapture();
+        break;
+
+    case WM_MOUSEMOVE:
+        {
+            POINT currentMousePos;
+            currentMousePos.x = LOWORD(lParam);
+            currentMousePos.y = HIWORD(lParam);
+
+            if (isLooking) {
+                cameraAngleY += (currentMousePos.x - lastMousePos.x) * 0.2f;
+                cameraAngleX += (currentMousePos.y - lastMousePos.y) * 0.2f;
+            }
+            else if (isDraggingGizmo) {
+                float dx = (float)(currentMousePos.x - lastMousePos.x);
+                float dy = (float)(currentMousePos.y - lastMousePos.y);
+
+                if (gizmoMode == 0) {
+                    float dragSpeed = 2.0f;
+                    if (activeGizmoAxis == 1) tubPosX += dx * dragSpeed;
+                    else if (activeGizmoAxis == 2) tubPosY -= dy * dragSpeed;
+                    else if (activeGizmoAxis == 3) tubPosZ -= dx * dragSpeed; // Rough mapping for Z
+                } else {
+                    float rotSpeed = 0.5f;
+                    if (activeGizmoAxis == 1) tubAngleX += dy * rotSpeed;
+                    else if (activeGizmoAxis == 2) tubAngleY += dx * rotSpeed;
+                    else if (activeGizmoAxis == 3) tubAngleZ += dx * rotSpeed; 
+                }
+            }
+
+            lastMousePos = currentMousePos;
+        }
+        break;
+
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+// --- Simulation Logic ---
+void SetupPixelFormat(HDC hDC) {
+    PIXELFORMATDESCRIPTOR pfd = {
+        sizeof(PIXELFORMATDESCRIPTOR), 1,
+        PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        PFD_TYPE_RGBA, 32,
+        0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0,
+        24, 8, 0,
+        PFD_MAIN_PLANE, 0, 0, 0, 0
+    };
+    int pixelFormat = ChoosePixelFormat(hDC, &pfd);
+    SetPixelFormat(hDC, pixelFormat, &pfd);
+}
+
+void InitSimulation() {
+    srand((unsigned int)time(NULL)); 
+    particles.clear();
+}
+
+void RotateTubToWorld(float lx, float ly, float lz, float& wx, float& wy, float& wz, float ax, float ay, float az) {
+    float radX = ax * 3.14159f / 180.0f;
+    float radY = ay * 3.14159f / 180.0f;
+    float radZ = az * 3.14159f / 180.0f;
+
+    // X rot
+    float rx1 = lx;
+    float ry1 = ly * cos(radX) - lz * sin(radX);
+    float rz1 = ly * sin(radX) + lz * cos(radX);
+
+    // Y rot
+    float rx2 = rx1 * cos(radY) + rz1 * sin(radY);
+    float ry2 = ry1;
+    float rz2 = -rx1 * sin(radY) + rz1 * cos(radY);
+
+    // Z rot
+    wx = rx2 * cos(radZ) - ry2 * sin(radZ);
+    wy = rx2 * sin(radZ) + ry2 * cos(radZ);
+    wz = rz2;
+}
+
+void RotateWorldToTub(float wx, float wy, float wz, float& lx, float& ly, float& lz, float ax, float ay, float az) {
+    float radX = -ax * 3.14159f / 180.0f;
+    float radY = -ay * 3.14159f / 180.0f;
+    float radZ = -az * 3.14159f / 180.0f;
+
+    // Inverse Z rot
+    float rx1 = wx * cos(radZ) - wy * sin(radZ);
+    float ry1 = wx * sin(radZ) + wy * cos(radZ);
+    float rz1 = wz;
+
+    // Inverse Y rot
+    float rx2 = rx1 * cos(radY) + rz1 * sin(radY);
+    float ry2 = ry1;
+    float rz2 = -rx1 * sin(radY) + rz1 * cos(radY);
+
+    // Inverse X rot
+    lx = rx2;
+    ly = ry2 * cos(radX) - rz2 * sin(radX);
+    lz = ry2 * sin(radX) + rz2 * cos(radX);
+}
+
+void WorldToTub(float wx, float wy, float wz, float& lx, float& ly, float& lz, float px, float py, float pz, float ax, float ay, float az) {
+    RotateWorldToTub(wx - px, wy - py, wz - pz, lx, ly, lz, ax, ay, az);
+}
+
+void TubToWorld(float lx, float ly, float lz, float& wx, float& wy, float& wz, float px, float py, float pz, float ax, float ay, float az) {
+    RotateTubToWorld(lx, ly, lz, wx, wy, wz, ax, ay, az);
+    wx += px; wy += py; wz += pz;
+}
+
+void UpdateSimulation(float deltaTime) {
+    if (deltaTime > 0.05f) deltaTime = 0.05f; // Clamp delta time to avoid instability
+
+    float moveSpeed = 500.0f;
+
+    // Free camera WASD movement
+    if (GetAsyncKeyState('W') & 0x8000) { 
+        cameraPosX += moveSpeed * deltaTime * sin(cameraAngleY * 3.14159f / 180.0f);
+        cameraPosZ -= moveSpeed * deltaTime * cos(cameraAngleY * 3.14159f / 180.0f);
+    }
+    if (GetAsyncKeyState('S') & 0x8000) { 
+        cameraPosX -= moveSpeed * deltaTime * sin(cameraAngleY * 3.14159f / 180.0f);
+        cameraPosZ += moveSpeed * deltaTime * cos(cameraAngleY * 3.14159f / 180.0f);
+    }
+    if (GetAsyncKeyState('A') & 0x8000) { 
+        cameraPosX -= moveSpeed * deltaTime * cos(cameraAngleY * 3.14159f / 180.0f);
+        cameraPosZ -= moveSpeed * deltaTime * sin(cameraAngleY * 3.14159f / 180.0f);
+    }
+    if (GetAsyncKeyState('D') & 0x8000) { 
+        cameraPosX += moveSpeed * deltaTime * cos(cameraAngleY * 3.14159f / 180.0f);
+        cameraPosZ += moveSpeed * deltaTime * sin(cameraAngleY * 3.14159f / 180.0f);
+    }
+    if (GetAsyncKeyState('E') & 0x8000) { cameraPosY += moveSpeed * deltaTime; }
+    if (GetAsyncKeyState('Q') & 0x8000) { cameraPosY -= moveSpeed * deltaTime; }
+
+    if (GetAsyncKeyState('T') & 0x8000) { gizmoMode = 0; }
+    if (GetAsyncKeyState('R') & 0x8000) { gizmoMode = 1; }
+
+    float rotSpeed = 90.0f; // degrees per second
+    // Rotate tub using arrow keys now
+    if (GetAsyncKeyState(VK_UP) & 0x8000) { tubAngleX -= rotSpeed * deltaTime; }
+    if (GetAsyncKeyState(VK_DOWN) & 0x8000) { tubAngleX += rotSpeed * deltaTime; }
+    if (GetAsyncKeyState(VK_LEFT) & 0x8000) { tubAngleZ += rotSpeed * deltaTime; }
+    if (GetAsyncKeyState(VK_RIGHT) & 0x8000) { tubAngleZ -= rotSpeed * deltaTime; }
+
+    isPouring = (GetAsyncKeyState('Z') & 0x8000) != 0;
+
+    // Remove particles that have fallen too far away so they don't lag the simulation
+    particles.erase(std::remove_if(particles.begin(), particles.end(), [](const Particle& p) {
+        return p.y > 2000.0f || p.y < -2000.0f || p.x > 2000.0f || p.x < -2000.0f || p.z > 2000.0f || p.z < -2000.0f;
+    }), particles.end());
+
+    if (isPouring) {
+        for(int i=0; i<3; i++) {
+            if (particles.size() >= MAX_PARTICLES) {
+                particles.erase(particles.begin()); // Remove the oldest particle so pouring never arbitrarily stops
+            }
+            Particle p = {};
+            p.x = spawnX + ((rand() % 40) - 20) * 1.0f;
+            p.y = spawnY;
+            p.z = spawnZ + ((rand() % 40) - 20) * 1.0f;
+            p.vx = ((rand() % 100) - 50) * 1.0f;
+            p.vy = -50.0f;
+            p.vz = ((rand() % 100) - 50) * 1.0f;
+            particles.push_back(p);
+        }
+    }
+
+    for (auto& p : particles) {
+        // Apply world gravity
+        p.vy -= GRAVITY * deltaTime;
+
+        // Update position
+        p.x += p.vx * deltaTime;
+        p.y += p.vy * deltaTime;
+        p.z += p.vz * deltaTime;
+
+        // Transform to local space for tub collision
+        float lx, ly, lz;
+        WorldToTub(p.x, p.y, p.z, lx, ly, lz, tubPosX, tubPosY, tubPosZ, tubAngleX, tubAngleY, tubAngleZ);
+
+        bool hit = false;
+        float lvx, lvy, lvz;
+        RotateWorldToTub(p.vx, p.vy, p.vz, lvx, lvy, lvz, tubAngleX, tubAngleY, tubAngleZ);
+
+        // Container collision logic handling fast movements and upside-down (exterior) collisions
+        if (ly < container.maxY && ly > container.minY - 150.0f &&
+            lx > container.minX - 150.0f && lx < container.maxX + 150.0f &&
+            lz > container.minZ - 150.0f && lz < container.maxZ + 150.0f) 
+        {
+            // If particle is strictly inside the tub's holding volume
+            if (ly >= container.minY && lx >= container.minX && lx <= container.maxX && lz >= container.minZ && lz <= container.maxZ) {
+                // Find nearest interior wall to push it back into the tub properly
+                float distMinX = std::abs(lx - container.minX);
+                float distMaxX = std::abs(lx - container.maxX);
+                float distMinZ = std::abs(lz - container.minZ);
+                float distMaxZ = std::abs(lz - container.maxZ);
+                float distMinY = std::abs(ly - container.minY);
+
+                float minDist = distMinX;
+                if (distMaxX < minDist) minDist = distMaxX;
+                if (distMinZ < minDist) minDist = distMinZ;
+                if (distMaxZ < minDist) minDist = distMaxZ;
+                if (distMinY < minDist) minDist = distMinY;
+
+                if (minDist == distMinY)      { ly = container.minY + PARTICLE_RADIUS; lvy *= -DAMPING; hit=true; }
+                else if (minDist == distMinX) { lx = container.minX + PARTICLE_RADIUS; lvx *= -DAMPING; hit=true; }
+                else if (minDist == distMaxX) { lx = container.maxX - PARTICLE_RADIUS; lvx *= -DAMPING; hit=true; }
+                else if (minDist == distMinZ) { lz = container.minZ + PARTICLE_RADIUS; lvz *= -DAMPING; hit=true; }
+                else if (minDist == distMaxZ) { lz = container.maxZ - PARTICLE_RADIUS; lvz *= -DAMPING; hit=true; }
+            }
+            // If particle hits the exterior bottom (when flipped upside-down)
+            else if (ly < container.minY && ly > container.minY - PARTICLE_RADIUS * 4.0f && 
+                     lx >= container.minX && lx <= container.maxX && lz >= container.minZ && lz <= container.maxZ) {
+                ly = container.minY - PARTICLE_RADIUS; 
+                lvy *= -DAMPING;
+                hit = true;
+            }
+        }
+
+        if (hit) {
+            TubToWorld(lx, ly, lz, p.x, p.y, p.z, tubPosX, tubPosY, tubPosZ, tubAngleX, tubAngleY, tubAngleZ);
+            RotateTubToWorld(lvx, lvy, lvz, p.vx, p.vy, p.vz, tubAngleX, tubAngleY, tubAngleZ);
+        }
+
+        // Removed the world floor so they can fall into the void and despawn
+    }
+
+    // Basic particle-particle collision physics
+    for (size_t i = 0; i < particles.size(); i++) {
+        for (size_t j = i + 1; j < particles.size(); j++) {
+            float dx = particles[i].x - particles[j].x;
+            float dy = particles[i].y - particles[j].y;
+            float dz = particles[i].z - particles[j].z;
+            float distSq = dx*dx + dy*dy + dz*dz;
+            float minDist = PARTICLE_RADIUS * 2.0f;
+            if (distSq > 0 && distSq < minDist * minDist) {
+                float dist = std::sqrt(distSq);
+                float overlap = minDist - dist;
+                float nx = dx / dist;
+                float ny = dy / dist;
+                float nz = dz / dist;
+
+                float push = overlap * 0.5f;
+                particles[i].x += nx * push;
+                particles[i].y += ny * push;
+                particles[i].z += nz * push;
+                particles[j].x -= nx * push;
+                particles[j].y -= ny * push;
+                particles[j].z -= nz * push;
+
+                particles[i].vx *= 0.99f;
+                particles[i].vy *= 0.99f;
+                particles[i].vz *= 0.99f;
+                particles[j].vx *= 0.99f;
+                particles[j].vy *= 0.99f;
+                particles[j].vz *= 0.99f;
+            }
+        }
+    }
+}
+
+void DrawSphere(float r, int lats, int longs) {
+    static GLUquadric* quad = gluNewQuadric();
+    gluSphere(quad, r, lats, longs);
+}
+
+void DrawBox(const Bounds& b) {
+    glDisable(GL_LIGHTING);
+    glColor3f(0.8f, 0.8f, 0.8f);
+    glBegin(GL_LINES);
+    
+    // Bottom
+    glVertex3f(b.minX, b.minY, b.minZ); glVertex3f(b.maxX, b.minY, b.minZ);
+    glVertex3f(b.maxX, b.minY, b.minZ); glVertex3f(b.maxX, b.minY, b.maxZ);
+    glVertex3f(b.maxX, b.minY, b.maxZ); glVertex3f(b.minX, b.minY, b.maxZ);
+    glVertex3f(b.minX, b.minY, b.maxZ); glVertex3f(b.minX, b.minY, b.minZ);
+    
+    // Top
+    glVertex3f(b.minX, b.maxY, b.minZ); glVertex3f(b.maxX, b.maxY, b.minZ);
+    glVertex3f(b.maxX, b.maxY, b.minZ); glVertex3f(b.maxX, b.maxY, b.maxZ);
+    glVertex3f(b.maxX, b.maxY, b.maxZ); glVertex3f(b.minX, b.maxY, b.maxZ);
+    glVertex3f(b.minX, b.maxY, b.maxZ); glVertex3f(b.minX, b.maxY, b.minZ);
+
+    // Sides
+    glVertex3f(b.minX, b.minY, b.minZ); glVertex3f(b.minX, b.maxY, b.minZ);
+    glVertex3f(b.maxX, b.minY, b.minZ); glVertex3f(b.maxX, b.maxY, b.minZ);
+    glVertex3f(b.maxX, b.minY, b.maxZ); glVertex3f(b.maxX, b.maxY, b.maxZ);
+    glVertex3f(b.minX, b.minY, b.maxZ); glVertex3f(b.minX, b.maxY, b.maxZ);
+    
+    glEnd();
+    glEnable(GL_LIGHTING);
+}
+
+void RenderSimulation() {
+    if (!hDC_global) return;
+
+    glClearColor(0.1f, 0.1f, 0.15f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glLoadIdentity();
+    // Free fly camera orientation mapping
+    glRotatef(cameraAngleX, 1.0f, 0.0f, 0.0f);
+    glRotatef(cameraAngleY, 0.0f, 1.0f, 0.0f);
+    glTranslatef(-cameraPosX, -cameraPosY, -cameraPosZ);
+
+    // Unproject to find mouse ray intersection with Y=200 plane for accurate pouring
+    GLdouble model[16], proj[16];
+    GLint view[4];
+    glGetDoublev(GL_MODELVIEW_MATRIX, model);
+    glGetDoublev(GL_PROJECTION_MATRIX, proj);
+    glGetIntegerv(GL_VIEWPORT, view);
+
+    GLdouble x1, y1, z1, x2, y2, z2;
+    gluUnProject(lastMousePos.x, view[3] - lastMousePos.y, 0.0, model, proj, view, &x1, &y1, &z1);
+    gluUnProject(lastMousePos.x, view[3] - lastMousePos.y, 1.0, model, proj, view, &x2, &y2, &z2);
+    if (y2 != y1) {
+        float t = (200.0f - (float)y1) / (float)(y2 - y1);
+        spawnX = (float)(x1 + t * (x2 - x1));
+        spawnY = 200.0f;
+        spawnZ = (float)(z1 + t * (z2 - z1));
+    }
+
+    // Draw Particles in world space
+    glColorMaterial(GL_FRONT_AND_BACK, GL_AMBIENT_AND_DIFFUSE);
+    glColor3f(0.2f, 0.6f, 0.9f); // Water blue
+
+    for (const auto& p : particles) {
+        glPushMatrix();
+        glTranslatef(p.x, p.y, p.z);
+        DrawSphere(PARTICLE_RADIUS, 8, 8); // low-poly to keep standard fast
+        glPopMatrix();
+    }
+
+    // Draw Tub in local space
+    glPushMatrix();
+    glTranslatef(tubPosX, tubPosY, tubPosZ);
+    glRotatef(tubAngleZ, 0.0f, 0.0f, 1.0f);
+    glRotatef(tubAngleY, 0.0f, 1.0f, 0.0f);
+    glRotatef(tubAngleX, 1.0f, 0.0f, 0.0f);
+    DrawBox(container);
+    glPopMatrix();
+
+    // Draw Gizmo (World Space translation for simplicity)
+    glDisable(GL_LIGHTING);
+    glDisable(GL_DEPTH_TEST); // Draw on top
+    glLineWidth(4.0f);
+    if (gizmoMode == 0) {
+        glBegin(GL_LINES);
+        // X Axis (Red)
+        glColor3f(activeGizmoAxis == 1 ? 1.0f : 0.6f, 0.0f, 0.0f);
+        glVertex3f(tubPosX, tubPosY, tubPosZ); glVertex3f(tubPosX + 150.0f, tubPosY, tubPosZ);
+        // Y Axis (Green)
+        glColor3f(0.0f, activeGizmoAxis == 2 ? 1.0f : 0.6f, 0.0f);
+        glVertex3f(tubPosX, tubPosY, tubPosZ); glVertex3f(tubPosX, tubPosY + 150.0f, tubPosZ);
+        // Z Axis (Blue)
+        glColor3f(0.0f, 0.0f, activeGizmoAxis == 3 ? 1.0f : 0.6f);
+        glVertex3f(tubPosX, tubPosY, tubPosZ); glVertex3f(tubPosX, tubPosY, tubPosZ + 150.0f);
+        glEnd();
+    } else {
+        for (int axis = 1; axis <= 3; axis++) {
+            if (activeGizmoAxis == axis) glColor3f(1.0f, 1.0f, 0.0f); // Highlight active
+            else if (axis == 1) glColor3f(0.6f, 0.0f, 0.0f);
+            else if (axis == 2) glColor3f(0.0f, 0.6f, 0.0f);
+            else glColor3f(0.0f, 0.0f, 0.6f);
+
+            glBegin(GL_LINE_LOOP);
+            for (int i=0; i<36; i++) {
+                float a = (float)i * 3.14159f * 2.0f / 36.0f;
+                float c = cos(a)*150.0f; float s = sin(a)*150.0f;
+                if (axis == 1) glVertex3f(tubPosX, tubPosY + c, tubPosZ + s);
+                if (axis == 2) glVertex3f(tubPosX + c, tubPosY, tubPosZ + s);
+                if (axis == 3) glVertex3f(tubPosX + c, tubPosY + s, tubPosZ);
+            }
+            glEnd();
+        }
+    }
+    glLineWidth(1.0f);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_LIGHTING);
+
+    SwapBuffers(hDC_global);
+}

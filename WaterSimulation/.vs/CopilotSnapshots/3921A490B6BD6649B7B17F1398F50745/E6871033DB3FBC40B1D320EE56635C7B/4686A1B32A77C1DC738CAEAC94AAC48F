@@ -1,0 +1,544 @@
+﻿#include <windows.h>
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <string>
+
+// Forward declarations
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+
+// --- Simulation Constants ---
+const int WINDOW_WIDTH = 1024;
+const int WINDOW_HEIGHT = 768;
+const float GRAVITY = 1500.0f;      // Strength of gravity (pixels/s^2)
+const int NUM_PARTICLES = 500;      // Number of water particles
+const float PARTICLE_RADIUS = 4.0f; // Visual radius of particles
+const float DAMPING = 0.75f;        // Energy loss on collision (0.0 - 1.0)
+const float CONTAINER_DRAG_FACTOR = 0.2f; // How much container movement affects particles
+
+// --- Particle Structure ---
+struct Particle {
+    float x, y;     // Position
+    float vx, vy;   // Velocity
+};
+
+// --- RECTF for floating point coordinates ---
+struct RECTF {
+    float left, top, right, bottom;
+};
+
+// --- Simulation State ---
+std::vector<Particle> particles;
+RECTF container;
+
+bool isDragging = false;
+POINT lastMousePos;
+
+// --- Function Prototypes ---
+void InitSimulation();
+void UpdateSimulation(float deltaTime);
+void RenderSimulation(HDC hdc);
+
+// --- WinMain: Application Entry Point ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    const wchar_t CLASS_NAME[] = L"WaterSimWindowClass";
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    RegisterClassW(&wc);
+
+    HWND hWnd = CreateWindowExW(
+        0,
+        CLASS_NAME,
+        L"Water Simulation",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_WIDTH, WINDOW_HEIGHT,
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (hWnd == NULL) {
+        return 0;
+    }
+
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+
+    // Main message loop for real-time updates
+    MSG msg = {};
+    auto lastTime = std::chrono::high_resolution_clock::now();
+
+    while (true) {
+        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        else {
+            // Game loop logic
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<float> deltaTime = currentTime - lastTime;
+            lastTime = currentTime;
+
+            UpdateSimulation(deltaTime.count());
+            InvalidateRect(hWnd, NULL, FALSE); // Request a repaint
+        }
+    }
+
+    return (int)msg.wParam;
+}
+
+// --- WndProc: Window Message Handler ---
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        InitSimulation();
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        // --- Double Buffering to prevent flicker ---
+        HDC memDC = CreateCompatibleDC(hdc);
+        RECT clientRect;
+        GetClientRect(hWnd, &clientRect);
+        HBITMAP memBitmap = CreateCompatibleBitmap(hdc, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
+        HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+        // Erase background
+        HBRUSH hbrBackground = CreateSolidBrush(RGB(10, 10, 20)); // Dark blue background
+        FillRect(memDC, &clientRect, hbrBackground);
+        DeleteObject(hbrBackground);
+
+        RenderSimulation(memDC);
+
+        // Copy back buffer to screen
+        BitBlt(hdc, 0, 0, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, memDC, 0, 0, SRCCOPY);
+
+        // Clean up GDI objects
+        SelectObject(memDC, oldBitmap);
+        DeleteObject(memBitmap);
+        DeleteDC(memDC);
+
+        EndPaint(hWnd, &ps);
+    }
+    break;
+
+    case WM_ERASEBKGND:
+        return 1; // Prevents flickering by handling background drawing in WM_PAINT
+
+    case WM_LBUTTONDOWN:
+        isDragging = true;
+        lastMousePos.x = LOWORD(lParam);
+        lastMousePos.y = HIWORD(lParam);
+        SetCapture(hWnd); // Capture mouse input even outside the window
+        break;
+
+    case WM_LBUTTONUP:
+        isDragging = false;
+        ReleaseCapture();
+        break;
+
+    case WM_MOUSEMOVE:
+        if (isDragging) {
+            POINT currentMousePos;
+            currentMousePos.x = LOWORD(lParam);
+            currentMousePos.y = HIWORD(lParam);
+
+            float dx = (float)(currentMousePos.x - lastMousePos.x);
+            float dy = (float)(currentMousePos.y - lastMousePos.y);
+
+            // Move the container
+            container.left += dx;
+            container.right += dx;
+            container.top += dy;
+            container.bottom += dy;
+
+            // Impart velocity to particles from container movement
+            for (auto& p : particles) {
+                p.vx += dx * CONTAINER_DRAG_FACTOR;
+                p.vy += dy * CONTAINER_DRAG_FACTOR;
+            }
+
+            lastMousePos = currentMousePos;
+        }
+        break;
+
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+// --- Simulation Logic ---
+
+void InitSimulation() {
+    // Initialize container in the center of the screen
+    container.left = (WINDOW_WIDTH / 2.0f) - 250.0f;
+    container.right = (WINDOW_WIDTH / 2.0f) + 250.0f;
+    container.top = (WINDOW_HEIGHT / 2.0f) - 200.0f;
+    container.bottom = (WINDOW_HEIGHT / 2.0f) + 200.0f;
+
+    // Initialize particles with random positions inside the container
+    particles.clear();
+    for (int i = 0; i < NUM_PARTICLES; ++i) {
+        Particle p = {};
+        float x_pos = container.left + PARTICLE_RADIUS + (rand() % (int)(container.right - container.left - 2 * PARTICLE_RADIUS));
+        float y_pos = container.top + PARTICLE_RADIUS + (rand() % (int)(container.bottom - container.top - 2 * PARTICLE_RADIUS));
+        p.x = x_pos;
+        p.y = y_pos;
+        particles.push_back(p);
+    }
+}
+
+void UpdateSimulation(float deltaTime) {
+    if (deltaTime > 0.05f) deltaTime = 0.05f; // Clamp delta time to avoid instability
+
+    for (auto& p : particles) {
+        // Apply gravity
+        p.vy += GRAVITY * deltaTime;
+
+        // Update position
+        p.x += p.vx * deltaTime;
+        p.y += p.vy * deltaTime;
+
+        // --- Collision with container walls ---
+        // Left wall
+        if (p.x - PARTICLE_RADIUS < container.left) {
+            p.x = container.left + PARTICLE_RADIUS;
+            p.vx *= -DAMPING;
+        }
+        // Right wall
+        if (p.x + PARTICLE_RADIUS > container.right) {
+            p.x = container.right - PARTICLE_RADIUS;
+            p.vx *= -DAMPING;
+        }
+        // Top wall
+        if (p.y - PARTICLE_RADIUS < container.top) {
+            p.y = container.top + PARTICLE_RADIUS;
+            p.vy *= -DAMPING;
+        }
+        // Bottom wall
+        if (p.y + PARTICLE_RADIUS > container.bottom) {
+            p.y = container.bottom - PARTICLE_RADIUS;
+            p.vy *= -DAMPING;
+        }
+    }
+}
+
+void RenderSimulation(HDC hdc) {
+    // Draw the container
+    HPEN hPen = CreatePen(PS_SOLID, 2, RGB(200, 200, 255)); // Light blue outline
+    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+
+    Rectangle(hdc, (int)container.left, (int)container.top, (int)container.right, (int)container.bottom);
+
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+
+    // Draw the particles
+    HBRUSH hParticleBrush = CreateSolidBrush(RGB(100, 150, 255)); // Water blue
+    SelectObject(hdc, hParticleBrush);
+    hPen = CreatePen(PS_NULL, 0, 0); // No outline for particles
+    hOldPen = (HPEN)SelectObject(hdc, hPen);
+
+
+    for (const auto& p : particles) {
+        int left = (int)(p.x - PARTICLE_RADIUS);
+        int top = (int)(p.y - PARTICLE_RADIUS);
+        int right = (int)(p.x + PARTICLE_RADIUS);
+        int bottom = (int)(p.y + PARTICLE_RADIUS);
+        Ellipse(hdc, left, top, right, bottom);
+    }
+
+    // Clean up
+    SelectObject(hdc, hOldBrush);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hParticleBrush);
+    DeleteObject(hPen);
+}
+
+#include <vector>
+#include <cmath>
+#include <chrono>
+#include <string>
+
+// Forward declarations
+LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
+
+// --- Simulation Constants ---
+const int WINDOW_WIDTH = 1024;
+const int WINDOW_HEIGHT = 768;
+const float GRAVITY = 1500.0f;      // Strength of gravity (pixels/s^2)
+const int NUM_PARTICLES = 500;      // Number of water particles
+const float PARTICLE_RADIUS = 4.0f; // Visual radius of particles
+const float DAMPING = 0.75f;        // Energy loss on collision (0.0 - 1.0)
+const float CONTAINER_DRAG_FACTOR = 0.2f; // How much container movement affects particles
+
+// --- Particle Structure ---
+struct Particle {
+    float x, y;     // Position
+    float vx, vy;   // Velocity
+};
+
+// --- RECTF for floating point coordinates ---
+struct RECTF {
+    float left, top, right, bottom;
+};
+
+// --- Simulation State ---
+std::vector<Particle> particles;
+RECTF container;
+
+bool isDragging = false;
+POINT lastMousePos;
+
+// --- Function Prototypes ---
+void InitSimulation();
+void UpdateSimulation(float deltaTime);
+void RenderSimulation(HDC hdc);
+
+// --- WinMain: Application Entry Point ---
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    const wchar_t CLASS_NAME[] = L"WaterSimWindowClass";
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.lpszClassName = CLASS_NAME;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+
+    RegisterClassW(&wc);
+
+    HWND hWnd = CreateWindowExW(
+        0,
+        CLASS_NAME,
+        L"Water Simulation",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_WIDTH, WINDOW_HEIGHT,
+        NULL, NULL, hInstance, NULL
+    );
+
+    if (hWnd == NULL) {
+        return 0;
+    }
+
+    ShowWindow(hWnd, nCmdShow);
+    UpdateWindow(hWnd);
+
+    // Main message loop for real-time updates
+    MSG msg = {};
+    auto lastTime = std::chrono::high_resolution_clock::now();
+
+    while (true) {
+        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                break;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+        else {
+            // Game loop logic
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            std::chrono::duration<float> deltaTime = currentTime - lastTime;
+            lastTime = currentTime;
+
+            UpdateSimulation(deltaTime.count());
+            InvalidateRect(hWnd, NULL, FALSE); // Request a repaint
+        }
+    }
+
+    return (int)msg.wParam;
+}
+
+// --- WndProc: Window Message Handler ---
+LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
+    switch (message) {
+    case WM_CREATE:
+        InitSimulation();
+        break;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        break;
+
+    case WM_PAINT:
+    {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        // --- Double Buffering to prevent flicker ---
+        HDC memDC = CreateCompatibleDC(hdc);
+        RECT clientRect;
+        GetClientRect(hWnd, &clientRect);
+        HBITMAP memBitmap = CreateCompatibleBitmap(hdc, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top);
+        HBITMAP oldBitmap = (HBITMAP)SelectObject(memDC, memBitmap);
+
+        // Erase background
+        HBRUSH hbrBackground = CreateSolidBrush(RGB(10, 10, 20)); // Dark blue background
+        FillRect(memDC, &clientRect, hbrBackground);
+        DeleteObject(hbrBackground);
+
+        RenderSimulation(memDC);
+
+        // Copy back buffer to screen
+        BitBlt(hdc, 0, 0, clientRect.right - clientRect.left, clientRect.bottom - clientRect.top, memDC, 0, 0, SRCCOPY);
+
+        // Clean up GDI objects
+        SelectObject(memDC, oldBitmap);
+        DeleteObject(memBitmap);
+        DeleteDC(memDC);
+
+        EndPaint(hWnd, &ps);
+    }
+    break;
+
+    case WM_ERASEBKGND:
+        return 1; // Prevents flickering by handling background drawing in WM_PAINT
+
+    case WM_LBUTTONDOWN:
+        isDragging = true;
+        lastMousePos.x = LOWORD(lParam);
+        lastMousePos.y = HIWORD(lParam);
+        SetCapture(hWnd); // Capture mouse input even outside the window
+        break;
+
+    case WM_LBUTTONUP:
+        isDragging = false;
+        ReleaseCapture();
+        break;
+
+    case WM_MOUSEMOVE:
+        if (isDragging) {
+            POINT currentMousePos;
+            currentMousePos.x = LOWORD(lParam);
+            currentMousePos.y = HIWORD(lParam);
+
+            float dx = (float)(currentMousePos.x - lastMousePos.x);
+            float dy = (float)(currentMousePos.y - lastMousePos.y);
+
+            // Move the container
+            container.left += dx;
+            container.right += dx;
+            container.top += dy;
+            container.bottom += dy;
+
+            // Impart velocity to particles from container movement
+            for (auto& p : particles) {
+                p.vx += dx * CONTAINER_DRAG_FACTOR;
+                p.vy += dy * CONTAINER_DRAG_FACTOR;
+            }
+
+            lastMousePos = currentMousePos;
+        }
+        break;
+
+    default:
+        return DefWindowProc(hWnd, message, wParam, lParam);
+    }
+    return 0;
+}
+
+// --- Simulation Logic ---
+
+void InitSimulation() {
+    // Initialize container in the center of the screen
+    container.left = (WINDOW_WIDTH / 2.0f) - 250.0f;
+    container.right = (WINDOW_WIDTH / 2.0f) + 250.0f;
+    container.top = (WINDOW_HEIGHT / 2.0f) - 200.0f;
+    container.bottom = (WINDOW_HEIGHT / 2.0f) + 200.0f;
+
+    // Initialize particles with random positions inside the container
+    particles.clear();
+    for (int i = 0; i < NUM_PARTICLES; ++i) {
+        Particle p = {};
+        float x_pos = container.left + PARTICLE_RADIUS + (rand() % (int)(container.right - container.left - 2 * PARTICLE_RADIUS));
+        float y_pos = container.top + PARTICLE_RADIUS + (rand() % (int)(container.bottom - container.top - 2 * PARTICLE_RADIUS));
+        p.x = x_pos;
+        p.y = y_pos;
+        particles.push_back(p);
+    }
+}
+
+void UpdateSimulation(float deltaTime) {
+    if (deltaTime > 0.05f) deltaTime = 0.05f; // Clamp delta time to avoid instability
+
+    for (auto& p : particles) {
+        // Apply gravity
+        p.vy += GRAVITY * deltaTime;
+
+        // Update position
+        p.x += p.vx * deltaTime;
+        p.y += p.vy * deltaTime;
+
+        // --- Collision with container walls ---
+        // Left wall
+        if (p.x - PARTICLE_RADIUS < container.left) {
+            p.x = container.left + PARTICLE_RADIUS;
+            p.vx *= -DAMPING;
+        }
+        // Right wall
+        if (p.x + PARTICLE_RADIUS > container.right) {
+            p.x = container.right - PARTICLE_RADIUS;
+            p.vx *= -DAMPING;
+        }
+        // Top wall
+        if (p.y - PARTICLE_RADIUS < container.top) {
+            p.y = container.top + PARTICLE_RADIUS;
+            p.vy *= -DAMPING;
+        }
+        // Bottom wall
+        if (p.y + PARTICLE_RADIUS > container.bottom) {
+            p.y = container.bottom - PARTICLE_RADIUS;
+            p.vy *= -DAMPING;
+        }
+    }
+}
+
+void RenderSimulation(HDC hdc) {
+    // Draw the container
+    HPEN hPen = CreatePen(PS_SOLID, 2, RGB(200, 200, 255)); // Light blue outline
+    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+
+    Rectangle(hdc, (int)container.left, (int)container.top, (int)container.right, (int)container.bottom);
+
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hPen);
+
+    // Draw the particles
+    HBRUSH hParticleBrush = CreateSolidBrush(RGB(100, 150, 255)); // Water blue
+    SelectObject(hdc, hParticleBrush);
+    hPen = CreatePen(PS_NULL, 0, 0); // No outline for particles
+    hOldPen = (HPEN)SelectObject(hdc, hPen);
+
+
+    for (const auto& p : particles) {
+        int left = (int)(p.x - PARTICLE_RADIUS);
+        int top = (int)(p.y - PARTICLE_RADIUS);
+        int right = (int)(p.x + PARTICLE_RADIUS);
+        int bottom = (int)(p.y + PARTICLE_RADIUS);
+        Ellipse(hdc, left, top, right, bottom);
+    }
+
+    // Clean up
+    SelectObject(hdc, hOldBrush);
+    SelectObject(hdc, hOldPen);
+    DeleteObject(hParticleBrush);
+    DeleteObject(hPen);
+}

@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="WaterSimulation.vcxproj" Id="85976981-00e8-4c24-9d46-f6beb50d78ff" />
+</Solution>
