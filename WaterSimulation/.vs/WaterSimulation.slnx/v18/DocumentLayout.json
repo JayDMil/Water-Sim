@@ -1,0 +1,37 @@
+{
+  "Version": 1,
+  "WorkspaceRootPath": "C:\\Users\\ssblu\\OneDrive\\Documents\\Porjects\\Water-Sim\\WaterSimulation\\",
+  "Documents": [
+    {
+      "AbsoluteMoniker": "D:0:0:{85976981-00E8-4C24-9D46-F6BEB50D78FF}|WaterSimulation.vcxproj|C:\\Users\\ssblu\\OneDrive\\Documents\\Porjects\\Water-Sim\\WaterSimulation\\WaterSim.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}",
+      "RelativeMoniker": "D:0:0:{85976981-00E8-4C24-9D46-F6BEB50D78FF}|WaterSimulation.vcxproj|solutionrelative:WaterSim.cpp||{D0E1A5C6-B359-4E41-9B60-3365922C2A22}"
+    }
+  ],
+  "DocumentGroupContainers": [
+    {
+      "Orientation": 0,
+      "VerticalTabListWidth": 256,
+      "DocumentGroups": [
+        {
+          "DockedWidth": 200,
+          "SelectedChildIndex": 0,
+          "Children": [
+            {
+              "$type": "Document",
+              "DocumentIndex": 0,
+              "Title": "WaterSim.cpp",
+              "DocumentMoniker": "C:\\Users\\ssblu\\OneDrive\\Documents\\Porjects\\Water-Sim\\WaterSimulation\\WaterSim.cpp",
+              "RelativeDocumentMoniker": "WaterSim.cpp",
+              "ToolTip": "C:\\Users\\ssblu\\OneDrive\\Documents\\Porjects\\Water-Sim\\WaterSimulation\\WaterSim.cpp",
+              "RelativeToolTip": "WaterSim.cpp",
+              "ViewState": "AgIAAHUAAAAAAAAAAAAAAIsAAAAxAAAAAAAAAA==",
+              "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
+              "WhenOpened": "2026-04-14T18:53:06.609Z",
+              "EditorCaption": ""
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
